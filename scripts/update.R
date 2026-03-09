@@ -78,14 +78,26 @@ dbExecute(con, "
 CREATE INDEX IF NOT EXISTS idx_revdep_pkg ON reverse_dependencies (package)")
 
 # ---------------------------------------------------------------------------
-# Fetch current CRAN state
+# Fetch current CRAN state (with error handling)
 # ---------------------------------------------------------------------------
 cat("Fetching available.packages() ...\n")
-ap <- available.packages(repos = "https://cloud.r-project.org")
+ap <- tryCatch(
+  available.packages(repos = "https://cloud.r-project.org"),
+  error = function(e) {
+    message("ERROR: Failed to fetch available.packages(): ", conditionMessage(e))
+    quit(status = 1)
+  }
+)
 cat("  ->", nrow(ap), "packages from available.packages()\n")
 
 cat("Fetching tools::CRAN_package_db() ...\n")
-cran_db <- tools::CRAN_package_db()
+cran_db <- tryCatch(
+  tools::CRAN_package_db(),
+  error = function(e) {
+    message("ERROR: Failed to fetch tools::CRAN_package_db(): ", conditionMessage(e))
+    quit(status = 1)
+  }
+)
 cat("  ->", nrow(cran_db), "packages from CRAN_package_db()\n")
 
 # CRAN_package_db() can return duplicate rows for recommended packages;
@@ -126,7 +138,7 @@ cat("Removed packages: ", length(removed_pkgs), "\n")
 cat("Updated packages: ", length(updated_pkgs), "\n")
 
 # ---------------------------------------------------------------------------
-# Helper: parse maintainer field into name and email
+# Helper: parse maintainer field into name and email (vectorized)
 # ---------------------------------------------------------------------------
 parse_maintainer <- function(m) {
   m <- trimws(m)
@@ -141,7 +153,7 @@ parse_maintainer <- function(m) {
 }
 
 # ---------------------------------------------------------------------------
-# Record events in package_versions (append-only)
+# Record events in package_versions (append-only, wrapped in transaction)
 # ---------------------------------------------------------------------------
 now <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 
@@ -155,76 +167,92 @@ insert_event <- function(pkg, version, event_type, previous_version = NA,
                   removal_reason, now, published))
 }
 
-# New packages
-for (pkg in new_pkgs) {
-  ver <- current_versions[pkg]
-  pub <- if (pkg %in% rownames(cran_db)) as.character(cran_db[pkg, "Published"]) else NA
-  insert_event(pkg, ver, "new", published = pub)
-}
+dbBegin(con)
+tryCatch({
+  # New packages
+  for (pkg in new_pkgs) {
+    ver <- current_versions[pkg]
+    pub <- if (pkg %in% rownames(cran_db)) as.character(cran_db[pkg, "Published"]) else NA
+    insert_event(pkg, ver, "new", published = pub)
+  }
 
-# Updated packages
-for (pkg in updated_pkgs) {
-  ver <- current_versions[pkg]
-  prev_ver <- prev_versions[pkg]
-  pub <- if (pkg %in% rownames(cran_db)) as.character(cran_db[pkg, "Published"]) else NA
-  insert_event(pkg, ver, "updated", previous_version = prev_ver, published = pub)
-}
+  # Updated packages
+  for (pkg in updated_pkgs) {
+    ver <- current_versions[pkg]
+    prev_ver <- prev_versions[pkg]
+    pub <- if (pkg %in% rownames(cran_db)) as.character(cran_db[pkg, "Published"]) else NA
+    insert_event(pkg, ver, "updated", previous_version = prev_ver, published = pub)
+  }
 
-# Removed packages
-for (pkg in removed_pkgs) {
-  prev_ver <- prev_versions[pkg]
-  insert_event(pkg, prev_ver, "removed", removal_reason = "no longer on CRAN")
-}
+  # Removed packages
+  for (pkg in removed_pkgs) {
+    prev_ver <- prev_versions[pkg]
+    insert_event(pkg, prev_ver, "removed", removal_reason = "no longer on CRAN")
+  }
+
+  dbCommit(con)
+}, error = function(e) {
+  dbRollback(con)
+  stop(e)
+})
 
 cat("Events recorded.\n")
 
 # ---------------------------------------------------------------------------
-# Rebuild packages table from current state
+# Rebuild packages table from current state (vectorized construction)
 # ---------------------------------------------------------------------------
 cat("Rebuilding packages table ...\n")
 
-dbExecute(con, "DELETE FROM packages")
-
-# Safe accessor for cran_db columns
-cran_val <- function(pkg, col) {
-  if (pkg %in% rownames(cran_db) && col %in% colnames(cran_db)) {
-    val <- cran_db[pkg, col]
-    if (is.null(val) || length(val) == 0) NA_character_ else as.character(val)
-  } else {
-    NA_character_
-  }
+# Safe vectorized accessor for cran_db columns
+cran_col <- function(pkgs, col) {
+  if (!(col %in% colnames(cran_db))) return(rep(NA_character_, length(pkgs)))
+  idx <- match(pkgs, rownames(cran_db))
+  vals <- rep(NA_character_, length(pkgs))
+  found <- !is.na(idx)
+  vals[found] <- as.character(cran_db[[col]][idx[found]])
+  vals
 }
 
-# Build data.frame for bulk insert
-pkg_rows <- lapply(current_names, function(pkg) {
-  ver   <- current_versions[pkg]
-  maint <- cran_val(pkg, "Maintainer")
-  parsed <- parse_maintainer(maint)
+# Parse all maintainers at once
+raw_maintainers <- cran_col(current_names, "Maintainer")
+maint_names  <- character(length(current_names))
+maint_emails <- character(length(current_names))
+for (k in seq_along(raw_maintainers)) {
+  parsed <- parse_maintainer(raw_maintainers[k])
+  maint_names[k]  <- parsed$name
+  maint_emails[k] <- parsed$email
+}
 
-  data.frame(
-    name              = pkg,
-    version           = ver,
-    title             = cran_val(pkg, "Title"),
-    description       = cran_val(pkg, "Description"),
-    maintainer        = parsed$name,
-    maintainer_email  = parsed$email,
-    license           = cran_val(pkg, "License"),
-    depends           = cran_val(pkg, "Depends"),
-    imports           = cran_val(pkg, "Imports"),
-    suggests          = cran_val(pkg, "Suggests"),
-    linking_to        = cran_val(pkg, "LinkingTo"),
-    needs_compilation = as.character(ap[pkg, "NeedsCompilation"]),
-    published         = cran_val(pkg, "Published"),
-    cran_url          = paste0("https://CRAN.R-project.org/package=", pkg),
-    first_published   = NA_character_,
-    is_archived       = 0L,
-    updated_at        = now,
-    stringsAsFactors  = FALSE
-  )
+pkg_df <- data.frame(
+  name              = current_names,
+  version           = as.character(current_versions[current_names]),
+  title             = cran_col(current_names, "Title"),
+  description       = cran_col(current_names, "Description"),
+  maintainer        = maint_names,
+  maintainer_email  = maint_emails,
+  license           = cran_col(current_names, "License"),
+  depends           = cran_col(current_names, "Depends"),
+  imports           = cran_col(current_names, "Imports"),
+  suggests          = cran_col(current_names, "Suggests"),
+  linking_to        = cran_col(current_names, "LinkingTo"),
+  needs_compilation = as.character(ap[current_names, "NeedsCompilation"]),
+  published         = cran_col(current_names, "Published"),
+  cran_url          = paste0("https://CRAN.R-project.org/package=", current_names),
+  first_published   = NA_character_,
+  is_archived       = 0L,
+  updated_at        = now,
+  stringsAsFactors  = FALSE
+)
+
+dbBegin(con)
+tryCatch({
+  dbExecute(con, "DELETE FROM packages")
+  dbWriteTable(con, "packages", pkg_df, append = TRUE)
+  dbCommit(con)
+}, error = function(e) {
+  dbRollback(con)
+  stop(e)
 })
-pkg_df <- do.call(rbind, pkg_rows)
-
-dbWriteTable(con, "packages", pkg_df, append = TRUE)
 cat("  -> Inserted", nrow(pkg_df), "packages.\n")
 
 # ---------------------------------------------------------------------------
@@ -242,48 +270,55 @@ dbExecute(con, "
 ")
 
 # ---------------------------------------------------------------------------
-# Rebuild reverse_dependencies
+# Rebuild reverse_dependencies (pre-allocated vectors, no O(n^2) growth)
 # ---------------------------------------------------------------------------
 cat("Rebuilding reverse_dependencies ...\n")
-dbExecute(con, "DELETE FROM reverse_dependencies")
 
 dep_types <- c("Depends", "Imports", "Suggests", "LinkingTo")
 dep_labels <- c("depends", "imports", "suggests", "linking_to")
 
-all_revdeps <- list()
+pkg_vec  <- character(0)
+rev_vec  <- character(0)
+type_vec <- character(0)
 
 for (i in seq_along(dep_types)) {
   col <- dep_types[i]
   label <- dep_labels[i]
   if (!(col %in% colnames(ap))) next
-
-  for (pkg in current_names) {
-    raw <- ap[pkg, col]
+  raw_col <- ap[, col]
+  for (j in seq_along(current_names)) {
+    raw <- raw_col[j]
     if (is.na(raw) || raw == "") next
-    # Split on comma, strip version constraints and whitespace
     deps <- trimws(unlist(strsplit(raw, ",")))
     deps <- sub("\\s*\\(.*\\)\\s*$", "", deps)
-    deps <- trimws(deps)
     deps <- deps[deps != "" & deps != "R"]
-
-    for (dep in deps) {
-      all_revdeps[[length(all_revdeps) + 1]] <- data.frame(
-        package = dep, rev_package = pkg, type = label,
-        stringsAsFactors = FALSE
-      )
+    n <- length(deps)
+    if (n > 0) {
+      pkg_vec  <- c(pkg_vec, deps)
+      rev_vec  <- c(rev_vec, rep(current_names[j], n))
+      type_vec <- c(type_vec, rep(label, n))
     }
   }
 }
 
-if (length(all_revdeps) > 0) {
-  revdep_df <- do.call(rbind, all_revdeps)
-  # Remove duplicates (composite PK)
-  revdep_df <- revdep_df[!duplicated(revdep_df), ]
-  dbWriteTable(con, "reverse_dependencies", revdep_df, append = TRUE)
-  cat("  -> Inserted", nrow(revdep_df), "reverse dependency rows.\n")
-} else {
-  cat("  -> No reverse dependencies found.\n")
-}
+dbBegin(con)
+tryCatch({
+  dbExecute(con, "DELETE FROM reverse_dependencies")
+  if (length(pkg_vec) > 0) {
+    revdep_df <- data.frame(package = pkg_vec, rev_package = rev_vec, type = type_vec,
+                            stringsAsFactors = FALSE)
+    # Remove duplicates (composite PK)
+    revdep_df <- revdep_df[!duplicated(revdep_df), ]
+    dbWriteTable(con, "reverse_dependencies", revdep_df, append = TRUE)
+    cat("  -> Inserted", nrow(revdep_df), "reverse dependency rows.\n")
+  } else {
+    cat("  -> No reverse dependencies found.\n")
+  }
+  dbCommit(con)
+}, error = function(e) {
+  dbRollback(con)
+  stop(e)
+})
 
 # ---------------------------------------------------------------------------
 # Release notes

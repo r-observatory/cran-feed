@@ -88,7 +88,9 @@ cat("Fetching tools::CRAN_package_db() ...\n")
 cran_db <- tools::CRAN_package_db()
 cat("  ->", nrow(cran_db), "packages from CRAN_package_db()\n")
 
-# Index CRAN_package_db by package name for quick lookup
+# CRAN_package_db() can return duplicate rows for recommended packages;
+# keep only the first occurrence of each package name.
+cran_db <- cran_db[!duplicated(cran_db$Package), ]
 rownames(cran_db) <- cran_db$Package
 
 # Current package names from available.packages

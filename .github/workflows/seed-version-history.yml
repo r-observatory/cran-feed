@@ -35,9 +35,9 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download latest --pattern "feed.db" || true
+        run: gh release download --pattern "feed.db" || true
 
-      - name: Fetch version history
+      - name: Fetch version history from CRAN archive
         run: |
           LIMIT="${{ inputs.limit }}"
           if [ "$LIMIT" = "0" ]; then
@@ -46,13 +46,23 @@ jobs:
             Rscript scripts/fetch-version-history.R feed.db --limit="$LIMIT"
           fi
 
+      - name: Convert version history into package_versions events
+        run: |
+          # Copy feed.db as the seed source, then merge back
+          cp feed.db feed-seed.db
+          Rscript scripts/seed-versions.R feed.db feed-seed.db
+          rm -f feed-seed.db
+
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v$(date -u +'%Y%m%d-%H%M%S')"
-          STATS=$(sqlite3 feed.db "SELECT COUNT(*) || ' versions across ' || COUNT(DISTINCT package) || ' packages (' || MIN(published) || ' to ' || MAX(published) || ')' FROM package_version_history")
+          PV_COUNT=$(sqlite3 feed.db "SELECT COUNT(*) FROM package_versions")
+          PVH_COUNT=$(sqlite3 feed.db "SELECT COUNT(*) FROM package_version_history")
+          PKG_COUNT=$(sqlite3 feed.db "SELECT COUNT(*) FROM packages")
+          DB_SIZE=$(du -h feed.db | cut -f1)
           gh release create "$TAG" feed.db \
             --title "Version History Seed $TAG" \
-            --notes "Seeded version history: $STATS" \
+            --notes-file release_notes.md \
             --latest

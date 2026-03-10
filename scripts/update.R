@@ -20,13 +20,13 @@ cat("Database path:", db_path, "\n")
 con <- dbConnect(SQLite(), db_path)
 on.exit(dbDisconnect(con), add = TRUE)
 
-dbExecute(con, "PRAGMA journal_mode=WAL")
-dbExecute(con, "PRAGMA synchronous=NORMAL")
+invisible(dbExecute(con, "PRAGMA journal_mode=WAL"))
+invisible(dbExecute(con, "PRAGMA synchronous=NORMAL"))
 
 # ---------------------------------------------------------------------------
 # Create tables if they don't exist
 # ---------------------------------------------------------------------------
-dbExecute(con, "
+invisible(dbExecute(con, "
 CREATE TABLE IF NOT EXISTS packages (
   name              TEXT PRIMARY KEY,
   version           TEXT,
@@ -45,9 +45,9 @@ CREATE TABLE IF NOT EXISTS packages (
   first_published   TEXT,
   is_archived       INTEGER DEFAULT 0,
   updated_at        TEXT
-)")
+)"))
 
-dbExecute(con, "
+invisible(dbExecute(con, "
 CREATE TABLE IF NOT EXISTS package_versions (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   package           TEXT NOT NULL,
@@ -57,25 +57,25 @@ CREATE TABLE IF NOT EXISTS package_versions (
   removal_reason    TEXT,
   detected_at       TEXT NOT NULL,
   published         TEXT
-)")
+)"))
 
-dbExecute(con, "
-CREATE INDEX IF NOT EXISTS idx_pv_package  ON package_versions (package)")
-dbExecute(con, "
-CREATE INDEX IF NOT EXISTS idx_pv_detected ON package_versions (detected_at)")
-dbExecute(con, "
-CREATE INDEX IF NOT EXISTS idx_pv_event    ON package_versions (event_type)")
+invisible(dbExecute(con, "
+CREATE INDEX IF NOT EXISTS idx_pv_package  ON package_versions (package)"))
+invisible(dbExecute(con, "
+CREATE INDEX IF NOT EXISTS idx_pv_detected ON package_versions (detected_at)"))
+invisible(dbExecute(con, "
+CREATE INDEX IF NOT EXISTS idx_pv_event    ON package_versions (event_type)"))
 
-dbExecute(con, "
+invisible(dbExecute(con, "
 CREATE TABLE IF NOT EXISTS reverse_dependencies (
   package     TEXT NOT NULL,
   rev_package TEXT NOT NULL,
   type        TEXT NOT NULL,
   PRIMARY KEY (package, rev_package, type)
-)")
+)"))
 
-dbExecute(con, "
-CREATE INDEX IF NOT EXISTS idx_revdep_pkg ON reverse_dependencies (package)")
+invisible(dbExecute(con, "
+CREATE INDEX IF NOT EXISTS idx_revdep_pkg ON reverse_dependencies (package)"))
 
 # ---------------------------------------------------------------------------
 # Fetch current CRAN state (with error handling)
@@ -259,7 +259,7 @@ cat("  -> Inserted", nrow(pkg_df), "packages.\n")
 # Set first_published from earliest "new" event in package_versions
 # ---------------------------------------------------------------------------
 cat("Setting first_published dates ...\n")
-dbExecute(con, "
+invisible(dbExecute(con, "
   UPDATE packages
   SET first_published = (
     SELECT MIN(detected_at)
@@ -267,7 +267,7 @@ dbExecute(con, "
     WHERE package_versions.package = packages.name
       AND package_versions.event_type = 'new'
   )
-")
+"))
 
 # ---------------------------------------------------------------------------
 # Rebuild reverse_dependencies (pre-allocated vectors, no O(n^2) growth)

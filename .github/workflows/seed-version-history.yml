@@ -1,0 +1,58 @@
+name: Seed Version History
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Packages per run (0 = all)'
+        default: '0'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cran-feed-update
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+
+      - name: Install RSQLite
+        run: Rscript -e 'install.packages("RSQLite", repos = "https://cloud.r-project.org")'
+
+      - name: Download previous database
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download latest --pattern "feed.db" || true
+
+      - name: Fetch version history
+        run: |
+          LIMIT="${{ inputs.limit }}"
+          if [ "$LIMIT" = "0" ]; then
+            Rscript scripts/fetch-version-history.R feed.db --limit=99999
+          else
+            Rscript scripts/fetch-version-history.R feed.db --limit="$LIMIT"
+          fi
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v$(date -u +'%Y%m%d-%H%M%S')"
+          STATS=$(sqlite3 feed.db "SELECT COUNT(*) || ' versions across ' || COUNT(DISTINCT package) || ' packages (' || MIN(published) || ' to ' || MAX(published) || ')' FROM package_version_history")
+          gh release create "$TAG" feed.db \
+            --title "Version History Seed $TAG" \
+            --notes "Seeded version history: $STATS" \
+            --latest

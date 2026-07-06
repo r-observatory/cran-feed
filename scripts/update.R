@@ -199,6 +199,26 @@ tryCatch({
 cat("Events recorded.\n")
 
 # ---------------------------------------------------------------------------
+# Collapse spurious duplicate "new" events.
+# This tracker's first run registered every current package version as a "new"
+# event; the version-history seed then recorded the same versions with their
+# real release dates. A genuine "new" is the first row for a (package, version);
+# drop any "new" that has an earlier row for the same pair. Real releases and
+# "removed" events are untouched. Runs every update, so a re-seed or a fresh
+# bootstrap can never leave duplicates behind.
+# ---------------------------------------------------------------------------
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_pv_pkg_ver ON package_versions (package, version)")
+dup_removed <- dbExecute(con, "
+  DELETE FROM package_versions
+   WHERE event_type = 'new'
+     AND EXISTS (
+       SELECT 1 FROM package_versions p2
+        WHERE p2.package = package_versions.package
+          AND p2.version = package_versions.version
+          AND p2.detected_at < package_versions.detected_at)")
+cat("Collapsed", dup_removed, "duplicate 'new' events.\n")
+
+# ---------------------------------------------------------------------------
 # Rebuild packages table from current state (vectorized construction)
 # ---------------------------------------------------------------------------
 cat("Rebuilding packages table ...\n")

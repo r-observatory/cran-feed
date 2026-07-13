@@ -123,3 +123,7 @@ The database is rebuilt every 6 hours via GitHub Actions (`0 */6 * * *`). Each r
 ## License
 
 The data originates from CRAN. This pipeline code is available under the MIT License.
+
+## Feedback
+
+Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.

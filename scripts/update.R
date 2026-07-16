@@ -6,6 +6,15 @@ options(timeout = 60)
 
 library(RSQLite)
 
+# Manifest helpers (file_sha256, summary_integrity_core, write_manifest),
+# resolved relative to this script so `Rscript scripts/update.R` finds them.
+.script_dir <- {
+  cli <- commandArgs(FALSE)
+  f <- sub("^--file=", "", grep("^--file=", cli, value = TRUE))
+  if (length(f) == 1L && nzchar(f)) dirname(normalizePath(f)) else "scripts"
+}
+source(file.path(.script_dir, "helpers.R"))
+
 # ---------------------------------------------------------------------------
 # CLI argument: path to the SQLite database
 # ---------------------------------------------------------------------------
@@ -18,7 +27,9 @@ cat("Database path:", db_path, "\n")
 # Connect and configure SQLite
 # ---------------------------------------------------------------------------
 con <- dbConnect(SQLite(), db_path)
-on.exit(dbDisconnect(con), add = TRUE)
+# Guarded so the explicit dbDisconnect() before the manifest is written (needed
+# to hash the finalized single-file bytes) is not double-disconnected at exit.
+on.exit(if (DBI::dbIsValid(con)) dbDisconnect(con), add = TRUE)
 
 invisible(dbExecute(con, "PRAGMA journal_mode=WAL"))
 invisible(dbExecute(con, "PRAGMA synchronous=NORMAL"))
@@ -376,5 +387,32 @@ if (length(removed_pkgs) > 0 && length(removed_pkgs) <= 20) {
 }
 
 writeLines(notes, "release_notes.md")
+
+# ---------------------------------------------------------------------------
+# Manifest: integrity / completeness core over the finalized feed.db
+# ---------------------------------------------------------------------------
+# Fold the WAL back into feed.db and CLOSE the connection before hashing, so the
+# manifest describes the exact single-file on-disk bytes with no open handle or
+# -wal/-shm sidecar skewing the size/sha256. This is the last DB-touching step.
+cat("Writing manifest ...\n")
+invisible(dbExecute(con, "PRAGMA wal_checkpoint(TRUNCATE)"))
+dbDisconnect(con)
+
+# complete = the DB holds the full, non-partial dataset. This run always
+# rebuilds `packages` and `reverse_dependencies` in full and carries the
+# complete accumulated `package_versions` event log - but update.yml downloads
+# and carries forward the previous feed.db release asset, which can also
+# carry an incrementally-seeded `package_version_history` table (owned by
+# seed-version-history.yml's manual, `--limit`-capped runs, not this one).
+# This run has no way to verify whether that table is fully seeded, so
+# complete is derived rather than hardcoded: FALSE whenever
+# `package_version_history` is present, so a partially-seeded table is never
+# over-claimed as complete. Freshness is tracked separately via the
+# manifest's generated_at and the db_sha256 fingerprint.
+complete <- !db_has_table(db_path, "package_version_history")
+core <- summary_integrity_core(db_path, complete = complete)
+manifest_path <- file.path(dirname(db_path), "manifest.json")
+write_manifest(manifest_path, core)
+cat("  -> Wrote", manifest_path, "with sha256", core$db_sha256, "\n")
 
 cat("Done. DB size:", db_size_mb, "MB\n")

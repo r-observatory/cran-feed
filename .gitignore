@@ -1,4 +1,5 @@
 *.db
 release_notes.md
+manifest.json
 .Rhistory
 .RData

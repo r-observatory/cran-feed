@@ -37,6 +37,23 @@ file_sha256 <- function(path) {
   stop("No SHA-256 backend found (need one of: digest, openssl, sha256sum, shasum)")
 }
 
+#' Whether a SQLite database file contains a table with the given name.
+#'
+#' Used by the update.R call site to derive the manifest's `complete` field
+#' honestly instead of hardcoding it: `package_version_history` is seeded
+#' incrementally (and possibly only partially, via a manual `--limit`-capped
+#' run) by seed-version-history.yml, not by update.R. If a previous release's
+#' feed.db carrying that table is downloaded and carried forward, update.R has
+#' no way to verify it is fully seeded, so its presence must drive `complete`
+#' to FALSE rather than being ignored.
+db_has_table <- function(db_path, table_name) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  nrow(DBI::dbGetQuery(con, "
+    SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    params = list(table_name))) > 0
+}
+
 #' Build the integrity / completeness core describing a finalized SQLite file.
 #'
 #' Returns a named list of TOP-LEVEL manifest fields computed from the exact

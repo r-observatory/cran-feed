@@ -83,6 +83,61 @@ test_that("summary_integrity_core reports filename, bytes, sha256, tables, compl
   expect_true(core$complete)
 })
 
+test_that("db_has_table detects presence/absence of a named table", {
+  db <- build_feed_db()
+  on.exit(unlink(db))
+
+  expect_false(db_has_table(db, "package_version_history"))
+  expect_true(db_has_table(db, "packages"))
+  expect_true(db_has_table(db, "package_versions"))
+})
+
+test_that("derived complete is TRUE when package_version_history is absent", {
+  # Mirrors the ordinary update.R run: packages/reverse_dependencies rebuilt
+  # in full, package_versions is the complete event log, and the
+  # seed-version-history.yml table has never been seeded into this feed.db.
+  db <- build_feed_db(n_pkgs = 2L, n_events = 3L, n_revdeps = 1L)
+  on.exit(unlink(db))
+
+  # Same derivation as the scripts/update.R call site.
+  complete <- !db_has_table(db, "package_version_history")
+  expect_true(complete)
+
+  core <- summary_integrity_core(db, complete = complete)
+  expect_true(core$complete)
+})
+
+test_that("derived complete is FALSE when a (possibly partial) package_version_history is present", {
+  # Simulates update.yml downloading a previous feed.db release that carries
+  # forward a package_version_history table seeded by a manual, --limit-capped
+  # seed-version-history.yml run. update.R cannot verify that table is fully
+  # seeded, so its mere presence must drive complete to FALSE - even though
+  # packages/reverse_dependencies/package_versions are themselves complete.
+  db <- build_feed_db(n_pkgs = 2L, n_events = 3L, n_revdeps = 1L)
+  on.exit(unlink(db))
+
+  con <- dbConnect(SQLite(), db)
+  dbExecute(con, "
+    CREATE TABLE package_version_history (
+      package   TEXT NOT NULL, version TEXT NOT NULL, published TEXT,
+      size_kb   REAL, source TEXT DEFAULT 'cran',
+      PRIMARY KEY (package, version))")
+  # Only one row seeded (of what would be a much larger backfill): a genuinely
+  # partial table, exactly the case this test must catch.
+  dbExecute(con, "
+    INSERT INTO package_version_history (package, version, published, size_kb, source)
+    VALUES ('pkg1', '0.9', '2020-01-01', 12.3, 'cran')")
+  dbExecute(con, "PRAGMA wal_checkpoint(TRUNCATE)")
+  dbDisconnect(con)
+
+  # Same derivation as the scripts/update.R call site.
+  complete <- !db_has_table(db, "package_version_history")
+  expect_false(complete)
+
+  core <- summary_integrity_core(db, complete = complete)
+  expect_false(core$complete)
+})
+
 test_that("summary_integrity_core sha256 matches an independent digest of the bytes", {
   # Compute the expected hash via an external CLI tool, independent of
   # file_sha256()'s own preferred backend (digest/openssl), so this test

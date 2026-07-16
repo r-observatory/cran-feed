@@ -398,13 +398,19 @@ cat("Writing manifest ...\n")
 invisible(dbExecute(con, "PRAGMA wal_checkpoint(TRUNCATE)"))
 dbDisconnect(con)
 
-# complete = TRUE (full-not-partial): every run rebuilds `packages` and
-# `reverse_dependencies` in full from the current CRAN state and carries the
-# complete accumulated `package_versions` event log, so feed.db always holds the
-# full, non-partial dataset. There is no chunked or deferred write state to
-# derive completeness from. Freshness is tracked separately via the manifest's
-# generated_at and the db_sha256 fingerprint.
-core <- summary_integrity_core(db_path, complete = TRUE)
+# complete = the DB holds the full, non-partial dataset. This run always
+# rebuilds `packages` and `reverse_dependencies` in full and carries the
+# complete accumulated `package_versions` event log - but update.yml downloads
+# and carries forward the previous feed.db release asset, which can also
+# carry an incrementally-seeded `package_version_history` table (owned by
+# seed-version-history.yml's manual, `--limit`-capped runs, not this one).
+# This run has no way to verify whether that table is fully seeded, so
+# complete is derived rather than hardcoded: FALSE whenever
+# `package_version_history` is present, so a partially-seeded table is never
+# over-claimed as complete. Freshness is tracked separately via the
+# manifest's generated_at and the db_sha256 fingerprint.
+complete <- !db_has_table(db_path, "package_version_history")
+core <- summary_integrity_core(db_path, complete = complete)
 manifest_path <- file.path(dirname(db_path), "manifest.json")
 write_manifest(manifest_path, core)
 cat("  -> Wrote", manifest_path, "with sha256", core$db_sha256, "\n")

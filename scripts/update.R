@@ -367,11 +367,15 @@ tryCatch({
 # or corrects rows, so the worst case is a cycle that changes nothing.
 cat("Refreshing current-version tarball sizes ...\n")
 tryCatch({
-  # Ordering matters: the archive backfill's record of which packages it has
-  # walked is seeded from package_version_history the first time it is asked
-  # for, so it has to be captured BEFORE the snapshot below adds a row for
-  # every package on CRAN. Otherwise the backfill would conclude it had already
-  # crawled all of them and stop ~10k packages short.
+  # Ordering matters on the one cycle that seeds: the archive backfill's record
+  # of which packages it has walked is copied from package_version_history the
+  # first time it is asked for, so it has to be captured BEFORE the snapshot
+  # below adds a row for every package on CRAN. Otherwise the backfill would
+  # conclude it had already crawled all of them and stop ~10k packages short.
+  # Every later cycle finds the seed marker in version_history_backfill_state
+  # and copies nothing, which is what keeps a from-scratch rebuild (the download
+  # step above is continue-on-error) from seeding a second time off a table this
+  # refresh has since filled.
   ensure_backfill_state(con)
 
   contrib_file <- tempfile(fileext = ".html")

@@ -256,3 +256,61 @@ test_that("backfill state on a database with no history yet starts empty", {
   ensure_backfill_state(con)
   expect_equal(length(backfill_crawled(con)), 0L)
 })
+
+test_that("a seed that found nothing is not repeated against a refreshed table", {
+  # The rebuilt-from-scratch case, which is not hypothetical: update.yml's
+  # "Download previous database" step is continue-on-error, and a release-asset
+  # download that fails is the incident that reset cran-queue and cost it 323k
+  # snapshots. When it happens here, feed.db starts empty and:
+  #
+  #   cycle N    package_version_history is empty, so the seed has nothing to
+  #              copy; the refresh then records the current release of every
+  #              package on CRAN
+  #   cycle N+1  the seed must NOT run again. It would now copy that full table
+  #              and mark every package as crawled, and the archive backfill
+  #              would have nothing to do, forever, without an error.
+  #
+  # "Nobody has seeded yet" and "the seed ran and found nothing" are different
+  # facts and a row count cannot tell them apart.
+  tmp <- tempfile(fileext = ".db")
+  on.exit(unlink(tmp))
+  con <- DBI::dbConnect(RSQLite::SQLite(), tmp)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  ensure_version_history(con)
+
+  ensure_backfill_state(con)
+  expect_equal(length(backfill_crawled(con)), 0L)
+
+  refresh_current_versions(con, parse_cran_listing(c(
+    contrib_line("AATtools", "0.0.3", "2025-02-01", "247K"),
+    contrib_line("abc", "2.2.2", "2024-06-01", "204K"),
+    contrib_line("zoo", "1.8-14", "2025-11-01", "901K"))))
+
+  ensure_backfill_state(con)
+  expect_equal(length(backfill_crawled(con)), 0L)
+  expect_setequal(
+    archive_backfill_todo(c("AATtools", "abc", "zoo"), backfill_crawled(con), 500L),
+    c("AATtools", "abc", "zoo"))
+})
+
+test_that("a database seeded before the marker existed is not re-seeded", {
+  # Upgrade path: version_history_backfill already holds packages, from a seed
+  # or from a crawl, but nothing recorded that a seed happened. Rows there are
+  # themselves evidence, so the marker is written and the seed is skipped rather
+  # than run a second time against a table the refresh has since grown.
+  db <- vh_db()
+  on.exit(unlink(db))
+  con <- DBI::dbConnect(RSQLite::SQLite(), db)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  DBI::dbExecute(con, "
+    CREATE TABLE version_history_backfill (package TEXT PRIMARY KEY, crawled_at TEXT)")
+  DBI::dbExecute(con, "
+    INSERT INTO version_history_backfill (package, crawled_at) VALUES ('abc', NULL)")
+
+  refresh_current_versions(con, parse_cran_listing(
+    contrib_line("brandNew", "1.0", "2026-08-01", "12K")))
+  ensure_backfill_state(con)
+
+  expect_setequal(backfill_crawled(con), "abc")
+})

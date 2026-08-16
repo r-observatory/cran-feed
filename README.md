@@ -147,7 +147,11 @@ about coverage:
   `/src/contrib/Archive/<pkg>/` one package at a time. That pass has never
   covered every package, so **history is incomplete for packages it has not
   reached**, and `manifest.json` reports `complete: false` for as long as that
-  is true. `version_history_backfill` records which packages it has walked.
+  is true. `version_history_backfill` records which packages it has walked, and
+  `version_history_backfill_state` records that its one-time seed from
+  `package_version_history` has happened, so a feed.db rebuilt from scratch
+  cannot seed a second time off the current-release refresh and conclude that
+  every package is already crawled.
 
 A historical caveat, since it is visible in older release assets: between
 2026-03-10 and 2026-08-15 this table was frozen. Its only writer was the manual

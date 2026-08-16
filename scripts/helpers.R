@@ -270,6 +270,9 @@ archive_backfill_todo <- function(cran_packages, already_done, limit = 500L) {
   todo
 }
 
+#' The key under which version_history_backfill_state records the seed.
+BACKFILL_SEEDED_KEY <- "seeded_at"
+
 #' Create the archive-backfill state table, seeding it once on first sight.
 #'
 #' "Which packages have I walked the archive for" used to be inferred from
@@ -280,21 +283,51 @@ archive_backfill_todo <- function(cran_packages, already_done, limit = 500L) {
 #' and the backfill would stall silently having missed the rest.
 #'
 #' The seed reproduces exactly what the old inference would have said at the
-#' moment of migration, and only when the table is empty, so a later call cannot
-#' re-widen it from a package_version_history the refresh has since grown.
-ensure_backfill_state <- function(con) {
+#' moment of migration, and it must run exactly once. Whether it has run is
+#' recorded as its own fact, in version_history_backfill_state, because a row
+#' count cannot tell "nobody has seeded yet" from "the seed ran and the table it
+#' copies was empty". Those two look identical after a from-scratch rebuild,
+#' which is a live possibility: update.yml's "Download previous database" step is
+#' continue-on-error, and a failed release-asset download is exactly what reset
+#' cran-queue and cost it 323k snapshots. With no marker the next cycle would
+#' re-seed from a package_version_history the refresh had meanwhile filled with
+#' every package on CRAN, mark all of them crawled, and leave
+#' archive_backfill_todo() returning nothing for good, silently.
+#'
+#' A version_history_backfill that already holds packages is itself evidence
+#' that a seed or a crawl happened before the marker existed, so it takes the
+#' marker rather than a second seed.
+#'
+#' Returns TRUE (invisibly) if this call performed the seed.
+ensure_backfill_state <- function(con,
+                                  at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")) {
   DBI::dbExecute(con, "
     CREATE TABLE IF NOT EXISTS version_history_backfill (
       package    TEXT PRIMARY KEY,
       crawled_at TEXT)")
-  seeded <- DBI::dbGetQuery(con, "
+  DBI::dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS version_history_backfill_state (
+      key   TEXT PRIMARY KEY,
+      value TEXT)")
+
+  marked <- DBI::dbGetQuery(con, "
+    SELECT COUNT(*) AS n FROM version_history_backfill_state WHERE key = ?",
+    params = list(BACKFILL_SEEDED_KEY))$n
+  if (marked > 0) return(invisible(FALSE))
+
+  known <- DBI::dbGetQuery(con, "
     SELECT COUNT(*) AS n FROM version_history_backfill")$n
-  if (seeded == 0 && DBI::dbExistsTable(con, "package_version_history")) {
+  seeded <- FALSE
+  if (known == 0 && DBI::dbExistsTable(con, "package_version_history")) {
     DBI::dbExecute(con, "
       INSERT OR IGNORE INTO version_history_backfill (package, crawled_at)
       SELECT DISTINCT package, NULL FROM package_version_history")
+    seeded <- TRUE
   }
-  invisible(TRUE)
+  DBI::dbExecute(con, "
+    INSERT OR REPLACE INTO version_history_backfill_state (key, value) VALUES (?, ?)",
+    params = list(BACKFILL_SEEDED_KEY, at))
+  invisible(seeded)
 }
 
 #' Packages whose CRAN archive has been walked.

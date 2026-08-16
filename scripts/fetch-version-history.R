@@ -81,7 +81,8 @@ dbExecute(con, "PRAGMA synchronous=NORMAL")
 ensure_version_history(con)
 # Capture "which archives have been crawled" BEFORE the snapshot below adds a
 # row for every package on CRAN; after that, package_version_history no longer
-# answers that question.
+# answers that question. Only the first call ever copies anything; after that
+# the seed marker in version_history_backfill_state stands in for it.
 ensure_backfill_state(con)
 
 # ---------------------------------------------------------------------------

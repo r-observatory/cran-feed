@@ -116,9 +116,53 @@ Indexes: `idx_pv_package`, `idx_pv_detected`, `idx_pv_event`
 PRIMARY KEY: (package, rev_package, type)
 Index: `idx_revdep_pkg`
 
+### package_version_history
+
+Every release of every package, with the size of its **compressed** `.tar.gz` as
+CRAN serves it. This is the only place that size is recorded anywhere in the
+pipeline: the code-metrics streams measure uncompressed source bytes, which is a
+different quantity (a median of ~2545x this column across the releases both
+cover, where a KB-to-bytes conversion would be a flat 1024x). Do not treat the
+two as interchangeable.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| package | TEXT | NOT NULL |
+| version | TEXT | NOT NULL |
+| published | TEXT | Release date as CRAN's index reports it |
+| size_kb | REAL | Compressed tarball size in KB |
+| source | TEXT | `cran` (the CRAN index) or `github-mirror` (fallback; no size) |
+
+PRIMARY KEY: (package, version)
+Indexes: `idx_pvh_package`, `idx_pvh_published`
+
+Filled from two directions, and the difference matters if you are reasoning
+about coverage:
+
+- **Current releases** are refreshed on every 6-hourly update from CRAN's
+  `/src/contrib/` index, so the newest release of every package CRAN currently
+  ships is present and current.
+- **Older releases** are backfilled by the manual
+  `Backfill Version History (CRAN archive)` workflow, which walks
+  `/src/contrib/Archive/<pkg>/` one package at a time. That pass has never
+  covered every package, so **history is incomplete for packages it has not
+  reached**, and `manifest.json` reports `complete: false` for as long as that
+  is true. `version_history_backfill` records which packages it has walked, and
+  `version_history_backfill_state` records that its one-time seed from
+  `package_version_history` has happened, so a feed.db rebuilt from scratch
+  cannot seed a second time off the current-release refresh and conclude that
+  every package is already crawled.
+
+A historical caveat, since it is visible in older release assets: between
+2026-03-10 and 2026-08-15 this table was frozen. Its only writer was the manual
+archive workflow, which skips any package that already has a row, so no run of
+it could record a new release of an established package. Rows in that window are
+correct but the table is missing releases published during it, until the current
+release of each package overwrites the gap.
+
 ## Update Schedule
 
-The database is rebuilt every 6 hours via GitHub Actions (`0 */6 * * *`). Each run creates a new release tagged with a timestamp.
+The database is rebuilt every 6 hours via GitHub Actions (`0 */6 * * *`). Each run creates a new release tagged with a timestamp. That cycle also refreshes `package_version_history` for current releases; the CRAN archive backfill behind it is a separate, manual workflow.
 
 ## License
 

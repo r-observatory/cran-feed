@@ -10,8 +10,21 @@
 #      For R-* tags (R compatibility snapshots), reads DESCRIPTION DCF
 #      to extract the actual package version.
 #
-# The script is incremental: it skips packages already in the DB.
-# Use --limit=N to cap packages per run (default 500).
+# This is the ARCHIVE BACKFILL. It walks src/contrib/Archive/<pkg>/ one package
+# at a time (a request plus a rate-limit sleep each), so it is incremental and
+# skips packages it has already crawled: their old releases are immutable, and
+# re-walking ~23k of them would take hours to learn nothing.
+#
+# That per-package skip is also why this script must NOT be the only thing
+# maintaining the table. A package with any row at all is never revisited, so no
+# number of runs here would ever record a new release of an established package.
+# Keeping current releases current is scripts/update.R's job, from the single
+# src/contrib/ index request it makes every cycle. The two paths share
+# helpers.R and split cleanly: update.R owns "now", this owns "before".
+#
+# Source 1 below still applies the current-release snapshot unconditionally, so
+# a run of this script is never a step backwards, but it is not the mechanism
+# that keeps the table fresh.
 #
 # Usage:
 #   Rscript fetch-version-history.R feed.db
@@ -21,6 +34,15 @@
 options(timeout = 300)
 
 library(RSQLite)
+
+# Shared with update.R: parse_size_kb, parse_cran_listing,
+# ensure_version_history, refresh_current_versions, archive_backfill_todo.
+.script_dir <- {
+  cli <- commandArgs(FALSE)
+  f <- sub("^--file=", "", grep("^--file=", cli, value = TRUE))
+  if (length(f) == 1L && nzchar(f)) dirname(normalizePath(f)) else "scripts"
+}
+source(file.path(.script_dir, "helpers.R"))
 
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
 
@@ -56,70 +78,12 @@ on.exit(dbDisconnect(con), add = TRUE)
 dbExecute(con, "PRAGMA journal_mode=WAL")
 dbExecute(con, "PRAGMA synchronous=NORMAL")
 
-dbExecute(con, "
-CREATE TABLE IF NOT EXISTS package_version_history (
-  package   TEXT NOT NULL,
-  version   TEXT NOT NULL,
-  published TEXT,
-  size_kb   REAL,
-  source    TEXT DEFAULT 'cran',
-  PRIMARY KEY (package, version)
-)")
-dbExecute(con, "
-CREATE INDEX IF NOT EXISTS idx_pvh_package   ON package_version_history (package)")
-dbExecute(con, "
-CREATE INDEX IF NOT EXISTS idx_pvh_published ON package_version_history (published)")
-
-# ---------------------------------------------------------------------------
-# Helper: parse size string ("4.7K", "901K", "6.1M") to numeric KB
-# ---------------------------------------------------------------------------
-parse_size_kb <- function(s) {
-  s <- trimws(s)
-  if (grepl("M$", s)) return(as.numeric(sub("M$", "", s)) * 1024)
-  if (grepl("K$", s)) return(as.numeric(sub("K$", "", s)))
-  as.numeric(s) / 1024
-}
-
-# ---------------------------------------------------------------------------
-# Helper: parse CRAN Apache directory listing into a data frame
-# Works for both src/contrib/ and src/contrib/Archive/{pkg}/
-# Each HTML row: <a href="pkg_ver.tar.gz">...</a></td><td>date</td><td>size</td>
-# ---------------------------------------------------------------------------
-parse_cran_listing <- function(html, pkg_filter = NULL) {
-  if (!is.null(pkg_filter)) {
-    pattern <- paste0(
-      "(", pkg_filter, ")_([^\"]+)\\.tar\\.gz</a>",
-      ".*?(\\d{4}-\\d{2}-\\d{2})\\s+\\d{2}:\\d{2}\\s*",
-      "</td>\\s*<td[^>]*>\\s*([0-9.]+[KMG]?)")
-  } else {
-    pattern <- paste0(
-      "([A-Za-z][A-Za-z0-9.]*[A-Za-z0-9])_([^\"]+)\\.tar\\.gz</a>",
-      ".*?(\\d{4}-\\d{2}-\\d{2})\\s+\\d{2}:\\d{2}\\s*",
-      "</td>\\s*<td[^>]*>\\s*([0-9.]+[KMG]?)")
-  }
-
-  packages <- character()
-  versions <- character()
-  dates    <- character()
-  sizes    <- numeric()
-
-  for (line in html) {
-    parts <- regmatches(line, regexec(pattern, line, perl = TRUE))[[1]]
-    if (length(parts) == 0) next
-    packages <- c(packages, parts[2])
-    versions <- c(versions, parts[3])
-    dates    <- c(dates,    parts[4])
-    sizes    <- c(sizes,    parse_size_kb(parts[5]))
-  }
-
-  if (length(packages) == 0) return(NULL)
-
-  data.frame(
-    package = packages, version = versions,
-    published = dates, size_kb = round(sizes, 1),
-    stringsAsFactors = FALSE
-  )
-}
+ensure_version_history(con)
+# Capture "which archives have been crawled" BEFORE the snapshot below adds a
+# row for every package on CRAN; after that, package_version_history no longer
+# answers that question. Only the first call ever copies anything; after that
+# the seed marker in version_history_backfill_state stands in for it.
+ensure_backfill_state(con)
 
 # ---------------------------------------------------------------------------
 # Source 1: Download main CRAN src/contrib/ listing (once for all packages)
@@ -145,6 +109,17 @@ if (dl_ok) {
 }
 unlink(contrib_file)
 
+# Apply the snapshot to every package in it, not just the ones this run is about
+# to crawl. It is already downloaded and it is the current release of everything
+# CRAN ships, so there is no reason to throw away the rows for packages the
+# archive walk below will skip. (update.R does this every cycle; repeating it
+# here just means a backfill run is never a step backwards.)
+if (!is.null(current_versions)) {
+  refresh_current_versions(con, current_versions)
+  cat("  -> Applied the current-release snapshot to all",
+      nrow(current_versions), "packages\n")
+}
+
 # ---------------------------------------------------------------------------
 # Determine which packages to process
 # ---------------------------------------------------------------------------
@@ -156,19 +131,15 @@ cran_packages <- if (!is.null(current_versions)) {
 }
 cat("CRAN has", length(cran_packages), "packages\n")
 
-already_done <- dbGetQuery(con,
-  "SELECT DISTINCT package FROM package_version_history")$package
+already_done <- backfill_crawled(con)
 
 if (!is.null(specific_packages)) {
   todo <- intersect(specific_packages, cran_packages)
   cat("Processing", length(todo), "specified packages\n")
 } else {
-  todo <- setdiff(cran_packages, already_done)
-  if (length(todo) > limit) {
-    todo <- head(sort(todo), limit)
-  }
+  todo <- archive_backfill_todo(cran_packages, already_done, limit)
   cat("To process:", length(todo), "(", length(already_done), "already done,",
-      length(cran_packages) - length(already_done), "remaining)\n")
+      length(setdiff(cran_packages, already_done)), "remaining)\n")
 }
 
 if (length(todo) == 0) {
@@ -348,6 +319,13 @@ for (b in seq_len(n_batches)) {
       cat(sprintf("  ERROR: %s\n", conditionMessage(e)))
     })
   }
+
+  # Mark the whole batch crawled, including packages that returned nothing at
+  # all: the expensive part is the request, and a package with an empty archive
+  # is exactly the one that would otherwise be re-requested on every run
+  # forever. This sits outside the insert block on purpose, since a batch where
+  # nothing came back is still a batch that was walked.
+  mark_backfilled(con, batch)
 }
 
 unlink(clone_dir, recursive = TRUE)

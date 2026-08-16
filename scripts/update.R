@@ -352,6 +352,54 @@ tryCatch({
 })
 
 # ---------------------------------------------------------------------------
+# Refresh current-version tarball sizes (package_version_history)
+# ---------------------------------------------------------------------------
+# One request to CRAN's /src/contrib/ index returns the version, date and
+# COMPRESSED tarball size of the current release of every package CRAN ships,
+# which is the whole of what this table needs to stay current. Doing it here,
+# every cycle, rather than in the archive backfill: the backfill skips any
+# package it has already crawled, so it structurally cannot record a new release
+# of an established package, which is how the table came to be frozen from
+# 2026-03-10 until this ran.
+#
+# Deliberately non-fatal. A CRAN blip or a layout change must not fail an
+# otherwise good feed update, and refresh_current_versions() only ever inserts
+# or corrects rows, so the worst case is a cycle that changes nothing.
+cat("Refreshing current-version tarball sizes ...\n")
+tryCatch({
+  # Ordering matters on the one cycle that seeds: the archive backfill's record
+  # of which packages it has walked is copied from package_version_history the
+  # first time it is asked for, so it has to be captured BEFORE the snapshot
+  # below adds a row for every package on CRAN. Otherwise the backfill would
+  # conclude it had already crawled all of them and stop ~10k packages short.
+  # Every later cycle finds the seed marker in version_history_backfill_state
+  # and copies nothing, which is what keeps a from-scratch rebuild (the download
+  # step above is continue-on-error) from seeding a second time off a table this
+  # refresh has since filled.
+  ensure_backfill_state(con)
+
+  contrib_file <- tempfile(fileext = ".html")
+  on.exit(unlink(contrib_file), add = TRUE)
+  download.file("https://cran.r-project.org/src/contrib/",
+                contrib_file, quiet = TRUE, mode = "w")
+  current <- parse_cran_listing(readLines(contrib_file, warn = FALSE))
+  if (is.null(current)) {
+    cat("  -> No tarball rows parsed from the index; leaving the table as it was.\n")
+  } else {
+    pvh_before <- if (dbExistsTable(con, "package_version_history")) {
+      dbGetQuery(con, "SELECT COUNT(*) AS n FROM package_version_history")$n
+    } else 0L
+    refresh_current_versions(con, current)
+    pvh_after <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM package_version_history")$n
+    cat("  -> Snapshot of", nrow(current), "current tarballs applied;",
+        pvh_after - pvh_before, "releases newly recorded (",
+        pvh_after, "rows total ).\n")
+  }
+}, error = function(e) {
+  cat("  -> Refresh skipped:", conditionMessage(e), "\n")
+})
+
+# ---------------------------------------------------------------------------
 # Release notes
 # ---------------------------------------------------------------------------
 cat("Writing release notes ...\n")
@@ -400,15 +448,17 @@ dbDisconnect(con)
 
 # complete = the DB holds the full, non-partial dataset. This run always
 # rebuilds `packages` and `reverse_dependencies` in full and carries the
-# complete accumulated `package_versions` event log - but update.yml downloads
-# and carries forward the previous feed.db release asset, which can also
-# carry an incrementally-seeded `package_version_history` table (owned by
-# seed-version-history.yml's manual, `--limit`-capped runs, not this one).
-# This run has no way to verify whether that table is fully seeded, so
-# complete is derived rather than hardcoded: FALSE whenever
-# `package_version_history` is present, so a partially-seeded table is never
-# over-claimed as complete. Freshness is tracked separately via the
-# manifest's generated_at and the db_sha256 fingerprint.
+# complete accumulated `package_versions` event log. `package_version_history`
+# is the one table that stays partial: the step above keeps the CURRENT release
+# of every package current, but the historical archive behind it is filled in
+# incrementally by seed-version-history.yml's `--limit`-capped runs and has
+# never covered every package. So complete is derived rather than hardcoded:
+# FALSE whenever `package_version_history` is present, which after this change
+# means every run that has the table. It is a standing statement that the
+# archive backfill is incomplete, not a claim about the rest of the DB, and it
+# is the same value this pipeline has emitted since the table first appeared.
+# Freshness is tracked separately via the manifest's generated_at and the
+# db_sha256 fingerprint.
 complete <- !db_has_table(db_path, "package_version_history")
 core <- summary_integrity_core(db_path, complete = complete)
 manifest_path <- file.path(dirname(db_path), "manifest.json")

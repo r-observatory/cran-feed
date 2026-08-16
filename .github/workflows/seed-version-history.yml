@@ -1,4 +1,17 @@
-name: Seed Version History
+# Archive backfill for package_version_history: walks
+# src/contrib/Archive/<pkg>/ for packages whose history has never been
+# collected, one HTTP request plus a rate-limit sleep each. Hours per full pass,
+# hence manual and --limit-capped.
+#
+# This is NOT what keeps the table current, and must not be relied on for that.
+# The CURRENT release of every package is refreshed by update.yml on its ordinary
+# 6-hourly cycle, from the single src/contrib/ index request scripts/update.R
+# already makes. This job only fills in history BEHIND that.
+#
+# The distinction is not academic: the table sat frozen from 2026-03-10 because
+# this was the only writer and it skips any package that already has a row, so
+# running it could never record a new release of an established package.
+name: Backfill Version History (CRAN archive)
 
 on:
   workflow_dispatch:
@@ -37,7 +50,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release download --pattern "feed.db" || true
 
-      - name: Fetch version history from CRAN archive
+      - name: Walk the CRAN archive for packages not yet backfilled
         run: |
           LIMIT="${{ inputs.limit }}"
           if [ "$LIMIT" = "0" ]; then

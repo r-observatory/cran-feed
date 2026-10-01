@@ -127,6 +127,107 @@ write_manifest <- function(path, core,
 }
 
 # ---------------------------------------------------------------------------
+# The live CRAN list
+# ---------------------------------------------------------------------------
+
+#' CRAN's PACKAGES index as available.packages() reads it, with only the
+#' duplicates filter. The default filters would drop OS_type: windows packages
+#' and any package needing a newer R than this runner, and the next run would
+#' record them as removed. A Recommended package listed twice keeps one row.
+cran_available <- function(repos = "https://cloud.r-project.org") {
+  utils::available.packages(repos = repos, type = "source", filters = "duplicates")
+}
+
+# ---------------------------------------------------------------------------
+# package_versions events
+# ---------------------------------------------------------------------------
+
+#' Delete "new" events that have an earlier row for the same (package, version).
+#' The tracker's first run and the later history seed both recorded some
+#' versions; a genuine "new" is the first row for its pair. Real releases and
+#' "removed" events are untouched. Returns the number of rows deleted.
+collapse_duplicate_new_events <- function(con) {
+  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_pv_pkg_ver ON package_versions (package, version)")
+  DBI::dbExecute(con, "
+    DELETE FROM package_versions
+     WHERE event_type = 'new'
+       AND EXISTS (
+         SELECT 1 FROM package_versions p2
+          WHERE p2.package = package_versions.package
+            AND p2.version = package_versions.version
+            AND p2.detected_at < package_versions.detected_at)")
+}
+
+#' Which of `pkgs` still have a "new" event detected at `detected_at`, that is,
+#' which were really new this run once the collapse has run.
+surviving_new <- function(con, pkgs, detected_at) {
+  if (length(pkgs) == 0L) return(character(0))
+  kept <- DBI::dbGetQuery(con, "
+    SELECT DISTINCT package FROM package_versions
+     WHERE event_type = 'new' AND detected_at = ?", params = list(detected_at))$package
+  intersect(pkgs, kept)
+}
+
+#' Seed events for packages listed for the first time that are not new to CRAN.
+#'
+#' `pkgs` maps package to its current CRAN version (a named character vector).
+#' A package with no package_versions row whose first release in
+#' package_version_history is more than `min_age_days` before `today` was
+#' hidden, not new: a listing filter kept it out. Its history becomes events
+#' the way seed-versions.R made them, first release "new" and later ones
+#' "updated", each dated to its publication day. A current version the history
+#' does not have yet is added as "updated" from the newest one it has.
+#' `read_archive` first completes the history of a package never walked.
+#' Returns the seeded package names, which the caller must not record as new.
+seed_events_for_first_sighted <- function(con, pkgs, today, min_age_days = 30L,
+                                          read_archive = read_cran_archive) {
+  pkgs <- pkgs[!is.na(names(pkgs)) & nzchar(names(pkgs))]
+  if (length(pkgs) == 0L || !DBI::dbExistsTable(con, "package_version_history")) {
+    return(character(0))
+  }
+  seen <- DBI::dbGetQuery(con, "SELECT DISTINCT package FROM package_versions")$package
+  pkgs <- pkgs[!(names(pkgs) %in% seen)]
+  if (length(pkgs) == 0L) return(character(0))
+  walk_unwalked_archives(con, names(pkgs), read_archive)
+  day    <- format(as.Date(today), "%Y-%m-%d")
+  cutoff <- format(as.Date(today) - min_age_days, "%Y-%m-%d")
+  seeded <- character(0)
+  DBI::dbBegin(con)
+  tryCatch({
+    for (p in names(pkgs)) {
+      h <- DBI::dbGetQuery(con, "
+        SELECT version, published FROM package_version_history
+         WHERE package = ? AND published IS NOT NULL AND published != ''
+         ORDER BY published ASC, version ASC", params = list(p))
+      if (nrow(h) == 0L || min(h$published) >= cutoff) next
+      ev <- data.frame(
+        version = h$version, previous_version = c(NA_character_, utils::head(h$version, -1L)),
+        detected_at = paste0(h$published, "T00:00:00Z"), published = h$published,
+        stringsAsFactors = FALSE)
+      current <- unname(pkgs[[p]])
+      if (!is.na(current) && !(current %in% h$version)) {
+        ev <- rbind(ev, data.frame(version = current, previous_version = utils::tail(h$version, 1L),
+                                   detected_at = paste0(day, "T00:00:00Z"),
+                                   published = NA_character_, stringsAsFactors = FALSE))
+      }
+      ev$event_type <- ifelse(is.na(ev$previous_version), "new", "updated")
+      DBI::dbExecute(con, "
+        INSERT INTO package_versions (package, version, event_type, previous_version,
+                                      removal_reason, detected_at, published)
+        VALUES (?, ?, ?, ?, NULL, ?, ?)",
+        params = list(rep(p, nrow(ev)), ev$version, ev$event_type, ev$previous_version,
+                      ev$detected_at, ev$published))
+      seeded <- c(seeded, p)
+    }
+    DBI::dbCommit(con)
+  }, error = function(e) {
+    DBI::dbRollback(con)
+    stop(e)
+  })
+  seeded
+}
+
+# ---------------------------------------------------------------------------
 # package_version_history
 #
 # This table is the org's only record of a CRAN package's COMPRESSED tarball
@@ -352,4 +453,54 @@ mark_backfilled <- function(con, packages,
     VALUES (?, ?)",
     params = list(packages, rep(at, length(packages))))
   length(packages)
+}
+
+#' Seconds to wait before each further attempt at an archive listing.
+ARCHIVE_RETRY_WAITS_S <- c(5, 15, 45)
+
+#' One package's archived releases as CRAN's /src/contrib/Archive/<pkg>/ index
+#' lists them, or NULL when it has none (a 404, or a page with no tarball rows).
+#' Any other failure is tried again after each of `waits`, one more attempt
+#' than there are waits, and is an error once they are used up, so a listing
+#' that could not be read is never taken for a package with no earlier release.
+#' `read_lines` and `sleep` are for the tests.
+read_cran_archive <- function(pkg,
+                              url = paste0("https://cran.r-project.org/src/contrib/Archive/",
+                                           pkg, "/"),
+                              read_lines = readLines,
+                              waits = ARCHIVE_RETRY_WAITS_S, sleep = Sys.sleep) {
+  attempts <- length(waits) + 1L
+  for (i in seq_len(attempts)) {
+    why <- ""
+    html <- withCallingHandlers(
+      tryCatch(read_lines(url, warn = FALSE), error = function(e) {
+        if (!nzchar(why)) why <<- conditionMessage(e)
+        NULL
+      }),
+      warning = function(w) {
+        why <<- conditionMessage(w)
+        invokeRestart("muffleWarning")
+      })
+    if (!is.null(html)) return(parse_cran_listing(html, pkg_filter = pkg))
+    if (grepl("'404 Not Found'", why, fixed = TRUE)) return(NULL)
+    if (i < attempts) {
+      message("Could not read ", url, ": ", why, ". Trying again in ", waits[[i]], "s.")
+      sleep(waits[[i]])
+    }
+  }
+  stop("Could not read ", url, " after ", attempts,
+       if (attempts == 1L) " attempt: " else " attempts: ", why, call. = FALSE)
+}
+
+#' Walk the archive of each of `pkgs` the backfill has not walked: its archived
+#' releases join package_version_history and it is marked walked, as the
+#' backfill would have done. An error from `read_archive` is passed on.
+#' Returns the packages walked.
+walk_unwalked_archives <- function(con, pkgs, read_archive = read_cran_archive) {
+  todo <- setdiff(pkgs, backfill_crawled(con))
+  for (p in todo) {
+    refresh_current_versions(con, read_archive(p))
+    mark_backfilled(con, p)
+  }
+  invisible(todo)
 }

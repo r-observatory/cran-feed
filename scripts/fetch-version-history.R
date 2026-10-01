@@ -127,7 +127,7 @@ cran_packages <- if (!is.null(current_versions)) {
   sort(unique(current_versions$package))
 } else {
   cat("  Falling back to available.packages() ...\n")
-  sort(rownames(available.packages(repos = "https://cloud.r-project.org")))
+  sort(rownames(cran_available("https://cloud.r-project.org")))
 }
 cat("CRAN has", length(cran_packages), "packages\n")
 

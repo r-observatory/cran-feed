@@ -177,21 +177,24 @@ surviving_new <- function(con, pkgs, detected_at) {
 #' the way seed-versions.R made them, first release "new" and later ones
 #' "updated", each dated to its publication day. A current version the history
 #' does not have yet is added as "updated" from the newest one it has.
+#' `read_archive` first completes the history of a package never walked.
 #' Returns the seeded package names, which the caller must not record as new.
-seed_events_for_first_sighted <- function(con, pkgs, today, min_age_days = 30L) {
+seed_events_for_first_sighted <- function(con, pkgs, today, min_age_days = 30L,
+                                          read_archive = read_cran_archive) {
   pkgs <- pkgs[!is.na(names(pkgs)) & nzchar(names(pkgs))]
   if (length(pkgs) == 0L || !DBI::dbExistsTable(con, "package_version_history")) {
     return(character(0))
   }
+  seen <- DBI::dbGetQuery(con, "SELECT DISTINCT package FROM package_versions")$package
+  pkgs <- pkgs[!(names(pkgs) %in% seen)]
+  if (length(pkgs) == 0L) return(character(0))
+  walk_unwalked_archives(con, names(pkgs), read_archive)
   day    <- format(as.Date(today), "%Y-%m-%d")
   cutoff <- format(as.Date(today) - min_age_days, "%Y-%m-%d")
   seeded <- character(0)
   DBI::dbBegin(con)
   tryCatch({
     for (p in names(pkgs)) {
-      known <- DBI::dbGetQuery(con, "
-        SELECT COUNT(*) AS n FROM package_versions WHERE package = ?", params = list(p))$n
-      if (known > 0) next
       h <- DBI::dbGetQuery(con, "
         SELECT version, published FROM package_version_history
          WHERE package = ? AND published IS NOT NULL AND published != ''
@@ -223,7 +226,6 @@ seed_events_for_first_sighted <- function(con, pkgs, today, min_age_days = 30L) 
   })
   seeded
 }
-
 
 # ---------------------------------------------------------------------------
 # package_version_history
@@ -451,4 +453,42 @@ mark_backfilled <- function(con, packages,
     VALUES (?, ?)",
     params = list(packages, rep(at, length(packages))))
   length(packages)
+}
+
+#' One package's archived releases as CRAN's /src/contrib/Archive/<pkg>/ index
+#' lists them, or NULL when it has none (a 404, or a page with no tarball rows).
+#' Any other failure is an error, so a listing that could not be read is never
+#' taken for a package with no earlier release. `read_lines` is for the tests.
+read_cran_archive <- function(pkg,
+                              url = paste0("https://cran.r-project.org/src/contrib/Archive/",
+                                           pkg, "/"),
+                              read_lines = readLines) {
+  why <- ""
+  html <- withCallingHandlers(
+    tryCatch(read_lines(url, warn = FALSE), error = function(e) {
+      if (!nzchar(why)) why <<- conditionMessage(e)
+      NULL
+    }),
+    warning = function(w) {
+      why <<- conditionMessage(w)
+      invokeRestart("muffleWarning")
+    })
+  if (is.null(html)) {
+    if (grepl("'404 Not Found'", why, fixed = TRUE)) return(NULL)
+    stop("Could not read ", url, ": ", why, call. = FALSE)
+  }
+  parse_cran_listing(html, pkg_filter = pkg)
+}
+
+#' Walk the archive of each of `pkgs` the backfill has not walked: its archived
+#' releases join package_version_history and it is marked walked, as the
+#' backfill would have done. An error from `read_archive` is passed on.
+#' Returns the packages walked.
+walk_unwalked_archives <- function(con, pkgs, read_archive = read_cran_archive) {
+  todo <- setdiff(pkgs, backfill_crawled(con))
+  for (p in todo) {
+    refresh_current_versions(con, read_archive(p))
+    mark_backfilled(con, p)
+  }
+  invisible(todo)
 }

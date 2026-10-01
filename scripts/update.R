@@ -180,7 +180,8 @@ insert_event <- function(pkg, version, event_type, previous_version = NA,
 
 # A package listed for the first time that was released long ago (kept out
 # until now by a listing filter) gets its history as events, not a "new" one.
-# Its CRAN archive is read first if never walked; a failed read stops the run.
+# Its CRAN archive is read first if never walked; a read that keeps failing
+# stops the run.
 seeded_pkgs <- seed_events_for_first_sighted(con, current_versions[new_pkgs],
                                              as.Date(substr(now, 1, 10)))
 new_pkgs <- setdiff(new_pkgs, seeded_pkgs)

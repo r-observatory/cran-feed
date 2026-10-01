@@ -245,23 +245,125 @@ test_that("read_cran_archive parses a listing and stops on one it cannot read", 
   expect_equal(got$package, c("RDesk", "RDesk"))
   expect_equal(got$version, c("1.0.4", "1.0.5"))
   expect_equal(got$published, c("2026-03-31", "2026-04-22"))
-  expect_error(read_cran_archive("RDesk", url = paste0("file://", listing, ".gone")),
+  expect_error(suppressMessages(read_cran_archive("RDesk", url = paste0("file://", listing, ".gone"),
+                                                  sleep = function(s) NULL)),
                "Could not read")
   writeLines("<html><body><h1>Index of /src/contrib/Archive/RDesk</h1></body></html>", listing)
   expect_null(read_cran_archive("RDesk", url = paste0("file://", listing)))
 })
 
+# What url() signals for a status of 400 or more: a warning, then an error.
+.status <- function(status) function(url, ...) {
+  warning("cannot open URL '", url, "': HTTP status was '", status, "'")
+  stop("cannot open the connection to '", url, "'")
+}
+
+# Stands in for readLines(): gives each of `answers` in turn and the last one
+# from then on, and counts the reads. An answer is a page or a failing function.
+.reads <- function(answers) {
+  n <- 0L
+  list(count = function() n,
+       read = function(url, ...) {
+         n <<- n + 1L
+         a <- answers[[min(n, length(answers))]]
+         if (is.function(a)) a(url, ...) else a
+       })
+}
+
+# Stands in for Sys.sleep() and records the waits asked for.
+.naps <- function() {
+  slept <- numeric(0)
+  list(slept = function() slept, sleep = function(s) slept <<- c(slept, s))
+}
+
 test_that("read_cran_archive takes a 404 for no archive and any other status for a failure", {
-  # What url() signals for a status of 400 or more: a warning, then an error.
-  answers <- function(status) function(url, ...) {
-    warning("cannot open URL '", url, "': HTTP status was '", status, "'")
-    stop("cannot open the connection to '", url, "'")
-  }
-  expect_null(read_cran_archive("hespdiv", read_lines = answers("404 Not Found")))
-  expect_error(read_cran_archive("hespdiv", read_lines = answers("503 Service Unavailable")),
+  quiet <- function(s) NULL
+  expect_null(read_cran_archive("hespdiv", read_lines = .status("404 Not Found"), sleep = quiet))
+  expect_error(suppressMessages(read_cran_archive(
+                 "hespdiv", read_lines = .status("503 Service Unavailable"), sleep = quiet)),
                "Archive/hespdiv/.*503 Service Unavailable")
-  expect_error(read_cran_archive("hespdiv", read_lines = function(url, ...) stop("timed out")),
+  expect_error(suppressMessages(read_cran_archive(
+                 "hespdiv", read_lines = function(url, ...) stop("timed out"), sleep = quiet)),
                "Could not read .*timed out")
+})
+
+test_that("read_cran_archive tries a failed listing again and returns it once it answers", {
+  r <- .reads(list(.status("503 Service Unavailable"), function(url, ...) stop("timed out"),
+                   c("<html><body><table>", .rdesk_archive, "</table></body></html>")))
+  z <- .naps()
+  said <- testthat::capture_messages(
+    got <- read_cran_archive("RDesk", read_lines = r$read, sleep = z$sleep))
+  expect_equal(got$version, c("1.0.4", "1.0.5"))
+  expect_equal(got$published, c("2026-03-31", "2026-04-22"))
+  expect_equal(r$count(), 3L)
+  expect_equal(z$slept(), c(5, 15))   # each wait is longer than the one before
+  expect_length(said, 2L)
+  expect_match(said[1], "Archive/RDesk/.*503 Service Unavailable.*5s")
+  expect_match(said[2], "timed out.*15s")
+})
+
+test_that("read_cran_archive stops after four attempts at a listing that keeps failing", {
+  r <- .reads(list(.status("503 Service Unavailable")))
+  z <- .naps()
+  expect_error(suppressMessages(read_cran_archive("RDesk", read_lines = r$read, sleep = z$sleep)),
+               "Could not read .*Archive/RDesk/ after 4 attempts: .*503 Service Unavailable")
+  expect_equal(r$count(), 4L)
+  expect_equal(z$slept(), c(5, 15, 45))   # no wait after the last attempt
+})
+
+test_that("read_cran_archive makes one more attempt than it is given waits", {
+  r <- .reads(list(.status("500 Internal Server Error")))
+  z <- .naps()
+  expect_error(suppressMessages(read_cran_archive("RDesk", read_lines = r$read,
+                                                  waits = c(1, 2), sleep = z$sleep)),
+               "after 3 attempts")
+  expect_equal(r$count(), 3L)
+  expect_equal(z$slept(), c(1, 2))
+  once <- .reads(list(.status("500 Internal Server Error")))
+  expect_error(read_cran_archive("RDesk", read_lines = once$read, waits = numeric(0),
+                                 sleep = z$sleep), "after 1 attempt: ")
+  expect_equal(once$count(), 1L)
+  expect_equal(z$slept(), c(1, 2))
+})
+
+test_that("read_cran_archive does not try a 404 again", {
+  r <- .reads(list(.status("404 Not Found")))
+  z <- .naps()
+  expect_null(read_cran_archive("hespdiv", read_lines = r$read, sleep = z$sleep))
+  expect_equal(r$count(), 1L)
+  expect_equal(z$slept(), numeric(0))
+})
+
+test_that("a 404 on a later attempt still means the package has no archive", {
+  r <- .reads(list(.status("503 Service Unavailable"), .status("404 Not Found")))
+  z <- .naps()
+  expect_null(suppressMessages(read_cran_archive("hespdiv", read_lines = r$read, sleep = z$sleep)))
+  expect_equal(r$count(), 2L)
+  expect_equal(z$slept(), 5)
+})
+
+test_that("a listing that answers on a later attempt does not stop the seeding", {
+  con <- .feed_db(); on.exit(DBI::dbDisconnect(con))
+  r <- .reads(list(.status("503 Service Unavailable"),
+                   c("<html><body><table>", .rdesk_archive, "</table></body></html>")))
+  z <- .naps()
+  flaky <- function(pkg) read_cran_archive(pkg, read_lines = r$read, sleep = z$sleep)
+  expect_equal(suppressMessages(.seed(con, c(RDesk = "1.0.7"), "2026-10-01", flaky)), "RDesk")
+  expect_equal(.events(con, "RDesk")$version, c("1.0.4", "1.0.5", "1.0.7"))
+  expect_equal(z$slept(), 5)
+  expect_true("RDesk" %in% backfill_crawled(con))
+})
+
+test_that("a listing that never answers stops the seeding after the last attempt", {
+  con <- .feed_db(); on.exit(DBI::dbDisconnect(con))
+  r <- .reads(list(.status("503 Service Unavailable")))
+  z <- .naps()
+  down <- function(pkg) read_cran_archive(pkg, read_lines = r$read, sleep = z$sleep)
+  expect_error(suppressMessages(.seed(con, c(RDesk = "1.0.7"), "2026-10-01", down)),
+               "after 4 attempts")
+  expect_equal(r$count(), 4L)
+  expect_equal(DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM package_versions")$n, 2L)
+  expect_false("RDesk" %in% backfill_crawled(con))
 })
 
 test_that("surviving_new reports only packages whose new event outlived the collapse", {

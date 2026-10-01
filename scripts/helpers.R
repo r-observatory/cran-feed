@@ -455,29 +455,41 @@ mark_backfilled <- function(con, packages,
   length(packages)
 }
 
+#' Seconds to wait before each further attempt at an archive listing.
+ARCHIVE_RETRY_WAITS_S <- c(5, 15, 45)
+
 #' One package's archived releases as CRAN's /src/contrib/Archive/<pkg>/ index
 #' lists them, or NULL when it has none (a 404, or a page with no tarball rows).
-#' Any other failure is an error, so a listing that could not be read is never
-#' taken for a package with no earlier release. `read_lines` is for the tests.
+#' Any other failure is tried again after each of `waits`, one more attempt
+#' than there are waits, and is an error once they are used up, so a listing
+#' that could not be read is never taken for a package with no earlier release.
+#' `read_lines` and `sleep` are for the tests.
 read_cran_archive <- function(pkg,
                               url = paste0("https://cran.r-project.org/src/contrib/Archive/",
                                            pkg, "/"),
-                              read_lines = readLines) {
-  why <- ""
-  html <- withCallingHandlers(
-    tryCatch(read_lines(url, warn = FALSE), error = function(e) {
-      if (!nzchar(why)) why <<- conditionMessage(e)
-      NULL
-    }),
-    warning = function(w) {
-      why <<- conditionMessage(w)
-      invokeRestart("muffleWarning")
-    })
-  if (is.null(html)) {
+                              read_lines = readLines,
+                              waits = ARCHIVE_RETRY_WAITS_S, sleep = Sys.sleep) {
+  attempts <- length(waits) + 1L
+  for (i in seq_len(attempts)) {
+    why <- ""
+    html <- withCallingHandlers(
+      tryCatch(read_lines(url, warn = FALSE), error = function(e) {
+        if (!nzchar(why)) why <<- conditionMessage(e)
+        NULL
+      }),
+      warning = function(w) {
+        why <<- conditionMessage(w)
+        invokeRestart("muffleWarning")
+      })
+    if (!is.null(html)) return(parse_cran_listing(html, pkg_filter = pkg))
     if (grepl("'404 Not Found'", why, fixed = TRUE)) return(NULL)
-    stop("Could not read ", url, ": ", why, call. = FALSE)
+    if (i < attempts) {
+      message("Could not read ", url, ": ", why, ". Trying again in ", waits[[i]], "s.")
+      sleep(waits[[i]])
+    }
   }
-  parse_cran_listing(html, pkg_filter = pkg)
+  stop("Could not read ", url, " after ", attempts,
+       if (attempts == 1L) " attempt: " else " attempts: ", why, call. = FALSE)
 }
 
 #' Walk the archive of each of `pkgs` the backfill has not walked: its archived

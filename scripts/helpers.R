@@ -127,6 +127,18 @@ write_manifest <- function(path, core,
 }
 
 # ---------------------------------------------------------------------------
+# The live CRAN list
+# ---------------------------------------------------------------------------
+
+#' CRAN's PACKAGES index as available.packages() reads it, with only the
+#' duplicates filter. The default filters would drop OS_type: windows packages
+#' and any package needing a newer R than this runner, and the next run would
+#' record them as removed. A Recommended package listed twice keeps one row.
+cran_available <- function(repos = "https://cloud.r-project.org") {
+  utils::available.packages(repos = repos, type = "source", filters = "duplicates")
+}
+
+# ---------------------------------------------------------------------------
 # package_version_history
 #
 # This table is the org's only record of a CRAN package's COMPRESSED tarball

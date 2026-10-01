@@ -93,7 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_revdep_pkg ON reverse_dependencies (package)"))
 # ---------------------------------------------------------------------------
 cat("Fetching available.packages() ...\n")
 ap <- tryCatch(
-  available.packages(repos = "https://cloud.r-project.org"),
+  cran_available("https://cloud.r-project.org"),
   error = function(e) {
     message("ERROR: Failed to fetch available.packages(): ", conditionMessage(e))
     quit(status = 1)

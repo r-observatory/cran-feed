@@ -139,6 +139,93 @@ cran_available <- function(repos = "https://cloud.r-project.org") {
 }
 
 # ---------------------------------------------------------------------------
+# package_versions events
+# ---------------------------------------------------------------------------
+
+#' Delete "new" events that have an earlier row for the same (package, version).
+#' The tracker's first run and the later history seed both recorded some
+#' versions; a genuine "new" is the first row for its pair. Real releases and
+#' "removed" events are untouched. Returns the number of rows deleted.
+collapse_duplicate_new_events <- function(con) {
+  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_pv_pkg_ver ON package_versions (package, version)")
+  DBI::dbExecute(con, "
+    DELETE FROM package_versions
+     WHERE event_type = 'new'
+       AND EXISTS (
+         SELECT 1 FROM package_versions p2
+          WHERE p2.package = package_versions.package
+            AND p2.version = package_versions.version
+            AND p2.detected_at < package_versions.detected_at)")
+}
+
+#' Which of `pkgs` still have a "new" event detected at `detected_at`, that is,
+#' which were really new this run once the collapse has run.
+surviving_new <- function(con, pkgs, detected_at) {
+  if (length(pkgs) == 0L) return(character(0))
+  kept <- DBI::dbGetQuery(con, "
+    SELECT DISTINCT package FROM package_versions
+     WHERE event_type = 'new' AND detected_at = ?", params = list(detected_at))$package
+  intersect(pkgs, kept)
+}
+
+#' Seed events for packages listed for the first time that are not new to CRAN.
+#'
+#' `pkgs` maps package to its current CRAN version (a named character vector).
+#' A package with no package_versions row whose first release in
+#' package_version_history is more than `min_age_days` before `today` was
+#' hidden, not new: a listing filter kept it out. Its history becomes events
+#' the way seed-versions.R made them, first release "new" and later ones
+#' "updated", each dated to its publication day. A current version the history
+#' does not have yet is added as "updated" from the newest one it has.
+#' Returns the seeded package names, which the caller must not record as new.
+seed_events_for_first_sighted <- function(con, pkgs, today, min_age_days = 30L) {
+  pkgs <- pkgs[!is.na(names(pkgs)) & nzchar(names(pkgs))]
+  if (length(pkgs) == 0L || !DBI::dbExistsTable(con, "package_version_history")) {
+    return(character(0))
+  }
+  day    <- format(as.Date(today), "%Y-%m-%d")
+  cutoff <- format(as.Date(today) - min_age_days, "%Y-%m-%d")
+  seeded <- character(0)
+  DBI::dbBegin(con)
+  tryCatch({
+    for (p in names(pkgs)) {
+      known <- DBI::dbGetQuery(con, "
+        SELECT COUNT(*) AS n FROM package_versions WHERE package = ?", params = list(p))$n
+      if (known > 0) next
+      h <- DBI::dbGetQuery(con, "
+        SELECT version, published FROM package_version_history
+         WHERE package = ? AND published IS NOT NULL AND published != ''
+         ORDER BY published ASC, version ASC", params = list(p))
+      if (nrow(h) == 0L || min(h$published) >= cutoff) next
+      ev <- data.frame(
+        version = h$version, previous_version = c(NA_character_, utils::head(h$version, -1L)),
+        detected_at = paste0(h$published, "T00:00:00Z"), published = h$published,
+        stringsAsFactors = FALSE)
+      current <- unname(pkgs[[p]])
+      if (!is.na(current) && !(current %in% h$version)) {
+        ev <- rbind(ev, data.frame(version = current, previous_version = utils::tail(h$version, 1L),
+                                   detected_at = paste0(day, "T00:00:00Z"),
+                                   published = NA_character_, stringsAsFactors = FALSE))
+      }
+      ev$event_type <- ifelse(is.na(ev$previous_version), "new", "updated")
+      DBI::dbExecute(con, "
+        INSERT INTO package_versions (package, version, event_type, previous_version,
+                                      removal_reason, detected_at, published)
+        VALUES (?, ?, ?, ?, NULL, ?, ?)",
+        params = list(rep(p, nrow(ev)), ev$version, ev$event_type, ev$previous_version,
+                      ev$detected_at, ev$published))
+      seeded <- c(seeded, p)
+    }
+    DBI::dbCommit(con)
+  }, error = function(e) {
+    DBI::dbRollback(con)
+    stop(e)
+  })
+  seeded
+}
+
+
+# ---------------------------------------------------------------------------
 # package_version_history
 #
 # This table is the org's only record of a CRAN package's COMPRESSED tarball

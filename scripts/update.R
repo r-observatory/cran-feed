@@ -178,6 +178,13 @@ insert_event <- function(pkg, version, event_type, previous_version = NA,
                   removal_reason, now, published))
 }
 
+# A package listed for the first time that was released long ago (kept out
+# until now by a listing filter) gets its history as events, not a "new" one.
+seeded_pkgs <- seed_events_for_first_sighted(con, current_versions[new_pkgs],
+                                             as.Date(substr(now, 1, 10)))
+new_pkgs <- setdiff(new_pkgs, seeded_pkgs)
+cat("Seeded from earlier releases:", length(seeded_pkgs), "\n")
+
 dbBegin(con)
 tryCatch({
   # New packages
@@ -210,24 +217,17 @@ tryCatch({
 cat("Events recorded.\n")
 
 # ---------------------------------------------------------------------------
-# Collapse spurious duplicate "new" events.
-# This tracker's first run registered every current package version as a "new"
-# event; the version-history seed then recorded the same versions with their
-# real release dates. A genuine "new" is the first row for a (package, version);
-# drop any "new" that has an earlier row for the same pair. Real releases and
-# "removed" events are untouched. Runs every update, so a re-seed or a fresh
-# bootstrap can never leave duplicates behind.
+# Collapse spurious duplicate "new" events. Runs every update, so a re-seed or
+# a fresh bootstrap can never leave duplicates behind.
 # ---------------------------------------------------------------------------
-dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_pv_pkg_ver ON package_versions (package, version)")
-dup_removed <- dbExecute(con, "
-  DELETE FROM package_versions
-   WHERE event_type = 'new'
-     AND EXISTS (
-       SELECT 1 FROM package_versions p2
-        WHERE p2.package = package_versions.package
-          AND p2.version = package_versions.version
-          AND p2.detected_at < package_versions.detected_at)")
+dup_removed <- collapse_duplicate_new_events(con)
 cat("Collapsed", dup_removed, "duplicate 'new' events.\n")
+
+# A listed package whose "new" did not survive the collapse already had
+# releases on record, so the notes report it with the seeded ones.
+really_new   <- surviving_new(con, new_pkgs, now)
+listed_known <- sort(c(seeded_pkgs, setdiff(new_pkgs, really_new)))
+new_pkgs     <- really_new
 
 # ---------------------------------------------------------------------------
 # Rebuild packages table from current state (vectorized construction)
@@ -417,6 +417,7 @@ notes <- paste0(
   "| New packages | ", length(new_pkgs), " |\n",
   "| Updated packages | ", length(updated_pkgs), " |\n",
   "| Removed packages | ", length(removed_pkgs), " |\n",
+  "| Listed with earlier releases | ", length(listed_known), " |\n",
   "| Total packages | ", total_pkgs, " |\n",
   "| Total events | ", total_events, " |\n",
   "| Reverse dependencies | ", revdep_count, " |\n",
@@ -432,6 +433,11 @@ if (length(new_pkgs) > 0 && length(new_pkgs) <= 20) {
 if (length(removed_pkgs) > 0 && length(removed_pkgs) <= 20) {
   notes <- paste0(notes, "\n### Removed packages\n\n",
                   paste0("- ", sort(removed_pkgs), collapse = "\n"), "\n")
+}
+
+if (length(listed_known) > 0 && length(listed_known) <= 20) {
+  notes <- paste0(notes, "\n### Listed with earlier releases\n\n",
+                  paste0("- ", listed_known, collapse = "\n"), "\n")
 }
 
 writeLines(notes, "release_notes.md")

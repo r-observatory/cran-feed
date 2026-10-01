@@ -4,6 +4,8 @@ Tracks new, updated, and removed packages on [CRAN](https://cran.r-project.org) 
 
 The `packages` table holds the current snapshot of all CRAN packages. The `package_versions` table is an append-only event log recording every addition, update, and removal. The `reverse_dependencies` table maps each package to the packages that depend on it.
 
+The package list is CRAN's `PACKAGES` index read with only the duplicates filter, so a package that declares `OS_type: windows`, or that needs a newer R than the runner, is tracked like any other. A package listed for the first time whose first release is more than 30 days old was hidden rather than new: its releases in `package_version_history` become its events, dated to their publication days, so it is never reported as a new package.
+
 ## Data Access
 
 ### Download the latest database

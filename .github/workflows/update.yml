@@ -40,10 +40,10 @@ jobs:
         run: Rscript tests/testthat.R
 
       - name: Download previous database
-        continue-on-error: true
+        # The pipeline's state; fails the run rather than starting from empty.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download --pattern "feed.db"
+        run: bash scripts/download-prior.sh
 
       - name: Run update script
         run: Rscript scripts/update.R feed.db

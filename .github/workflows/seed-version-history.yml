@@ -41,14 +41,14 @@ jobs:
         with:
           r-version: release
 
-      - name: Install RSQLite
-        run: Rscript -e 'install.packages("RSQLite", repos = "https://cloud.r-project.org")'
+      - name: Install RSQLite and jsonlite
+        run: Rscript -e 'install.packages(c("RSQLite", "jsonlite"), repos = "https://cloud.r-project.org")'
 
       - name: Download previous database
-        continue-on-error: true
+        # The pipeline's state; fails the run rather than starting from empty.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download --pattern "feed.db" || true
+        run: bash scripts/download-prior.sh
 
       - name: Walk the CRAN archive for packages not yet backfilled
         run: |
@@ -66,6 +66,9 @@ jobs:
           Rscript scripts/seed-versions.R feed.db feed-seed.db
           rm -f feed-seed.db
 
+      - name: Check retention and write the manifest
+        run: Rscript scripts/finalize-seed.R feed.db
+
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -75,7 +78,7 @@ jobs:
           PVH_COUNT=$(sqlite3 feed.db "SELECT COUNT(*) FROM package_version_history")
           PKG_COUNT=$(sqlite3 feed.db "SELECT COUNT(*) FROM packages")
           DB_SIZE=$(du -h feed.db | cut -f1)
-          gh release create "$TAG" feed.db \
+          gh release create "$TAG" feed.db manifest.json \
             --title "Version History Seed $TAG" \
             --notes-file release_notes.md \
             --latest

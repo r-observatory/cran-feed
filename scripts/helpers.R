@@ -127,6 +127,113 @@ write_manifest <- function(path, core,
 }
 
 # ---------------------------------------------------------------------------
+# Retention: what a run may not lose relative to the release it started from
+# ---------------------------------------------------------------------------
+
+# Tables that only ever grow, each with the column that dates its rows (NA when
+# nothing dates them). feed.db travels in the release asset, so each run's
+# output is the next run's input, and none of these can be rebuilt from CRAN:
+# the event log and the backfill's record exist only here, and the archive
+# history behind the current releases took hours of crawling to collect.
+# `packages` and `reverse_dependencies` are rebuilt from CRAN on every run and
+# are deliberately not held to this.
+ACCUMULATING_TABLES <- c(package_versions         = "detected_at",
+                         package_version_history  = "published",
+                         version_history_backfill = NA_character_)
+
+#' How big each accumulating table is and how far back it reaches.
+#'
+#' Recorded in the manifest so the NEXT run can check it did not lose anything.
+#' Row counts alone are not enough: a log that slid forward keeps its count
+#' while losing its earliest rows.
+feed_coverage <- function(db_path) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), db_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  present <- DBI::dbListTables(con)
+  out <- list()
+  for (tbl in intersect(names(ACCUMULATING_TABLES), present)) {
+    col <- ACCUMULATING_TABLES[[tbl]]
+    if (is.na(col)) {
+      r <- DBI::dbGetQuery(con, sprintf('SELECT COUNT(*) AS n FROM "%s"', tbl))
+      out[[tbl]] <- list(rows = as.integer(r$n))
+    } else {
+      r <- DBI::dbGetQuery(con, sprintf(
+        'SELECT COUNT(*) AS n, MIN("%s") AS lo, MAX("%s") AS hi FROM "%s"', col, col, tbl))
+      out[[tbl]] <- list(rows = as.integer(r$n), min = r$lo, max = r$hi)
+    }
+  }
+  out
+}
+
+#' What this run would destroy relative to the release it started from.
+#'
+#' cran-queue lost its history twice to a run that started from an empty file
+#' and published it: on 2026-07-16 a swallowed download, on 2026-10-03 a
+#' swallowed release lookup. Both runs were green, because nothing compared
+#' what they published with what they had been given. This is that comparison.
+#'
+#' `prior` is the previous release's parsed manifest.json, or NULL for a genuine
+#' cold start. Manifests published before this existed carry `tables` but no
+#' `coverage`, so row counts fall back to `tables` rather than passing
+#' vacuously on exactly the releases this first has to compare against.
+#'
+#' Returns a character vector of violations, empty when the run keeps
+#' everything.
+retention_violations <- function(now, prior) {
+  if (is.null(prior)) return(character(0))
+  usable <- function(x) !is.null(x) && length(x) == 1L && !is.na(x)
+  out <- character(0)
+  for (tbl in names(ACCUMULATING_TABLES)) {
+    was <- prior$coverage[[tbl]]
+    was_rows <- was$rows
+    if (!usable(was_rows)) was_rows <- prior$tables[[tbl]]
+    if (!usable(was_rows)) next
+    is_now <- now[[tbl]]
+    now_rows <- if (is.null(is_now)) 0L else is_now$rows
+    if (now_rows < as.integer(was_rows)) {
+      out <- c(out, sprintf("%s fell from %d rows to %d", tbl, as.integer(was_rows), now_rows))
+    }
+    if (usable(was$min) && usable(is_now$min) && is_now$min > was$min) {
+      out <- c(out, sprintf("the earliest %s.%s moved forward from %s to %s",
+                            tbl, ACCUMULATING_TABLES[[tbl]], was$min, is_now$min))
+    }
+  }
+  out
+}
+
+#' Read the previous release's manifest.json, or NULL when there is none.
+#'
+#' A manifest that is present but unreadable stops the run: carrying on would
+#' make the retention check pass vacuously, which is the hole this closes.
+read_prior_manifest <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  jsonlite::fromJSON(path, simplifyVector = FALSE)
+}
+
+#' Check a finalized feed.db against the previous release, then write its
+#' manifest with the coverage the next run will be checked against.
+#'
+#' Call only after the database connection is closed, so the hash describes the
+#' exact on-disk bytes. Stops, writing nothing, when the run lost history.
+publish_manifest <- function(db_path, prior, manifest_path) {
+  coverage <- feed_coverage(db_path)
+  violations <- retention_violations(coverage, prior)
+  if (length(violations) > 0) {
+    cat("\nRefusing to publish: this run would drop history the last release had.\n")
+    for (v in violations) cat("  -", v, "\n")
+    cat("The previous release still holds it. Do not re-run until the cause is known.\n")
+    stop("retention check failed")
+  }
+  # complete = the DB holds the full, non-partial dataset; see update.R for why
+  # package_version_history being present makes it FALSE.
+  complete <- !db_has_table(db_path, "package_version_history")
+  core <- summary_integrity_core(db_path, complete = complete)
+  core$coverage <- coverage
+  write_manifest(manifest_path, core)
+  invisible(core)
+}
+
+# ---------------------------------------------------------------------------
 # The live CRAN list
 # ---------------------------------------------------------------------------
 

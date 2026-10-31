@@ -23,6 +23,15 @@ db_path <- if (length(args) >= 1) args[1] else "feed.db"
 
 cat("Database path:", db_path, "\n")
 
+# The previous release's manifest, read before this run overwrites it. It is
+# what the run is held to before it may publish: feed.db travels in the release
+# asset, so a run that ships less than it started from cuts that history off
+# for every consumer.
+prior_manifest <- read_prior_manifest(file.path(dirname(db_path), "manifest.json"))
+if (is.null(prior_manifest)) {
+  cat("No previous manifest alongside the database; nothing to compare against.\n")
+}
+
 # ---------------------------------------------------------------------------
 # Connect and configure SQLite
 # ---------------------------------------------------------------------------
@@ -466,11 +475,10 @@ dbDisconnect(con)
 # archive backfill is incomplete, not a claim about the rest of the DB, and it
 # is the same value this pipeline has emitted since the table first appeared.
 # Freshness is tracked separately via the manifest's generated_at and the
-# db_sha256 fingerprint.
-complete <- !db_has_table(db_path, "package_version_history")
-core <- summary_integrity_core(db_path, complete = complete)
+# db_sha256 fingerprint. publish_manifest() derives it, and first refuses a run
+# that lost history the previous release had.
 manifest_path <- file.path(dirname(db_path), "manifest.json")
-write_manifest(manifest_path, core)
+core <- publish_manifest(db_path, prior_manifest, manifest_path)
 cat("  -> Wrote", manifest_path, "with sha256", core$db_sha256, "\n")
 
 cat("Done. DB size:", db_size_mb, "MB\n")
